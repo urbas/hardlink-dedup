@@ -1,0 +1,18 @@
+{
+  "python.defaultInterpreterPath": ".direnv/devEnv/bin/python",
+  "python.formatting.provider": "black",
+  "python.formatting.blackPath": ".direnv/devEnv/bin/black",
+  "python.linting.mypyPath": ".direnv/devEnv/bin/mypy",
+  "python.linting.mypyEnabled": true,
+  "python.linting.flake8Enabled": true,
+  "python.linting.flake8Path": ".direnv/devEnv/bin/flake8",
+  "search.exclude": {
+    ".direnv": true,
+  },
+  "files.watcherExclude": {
+    ".direnv": true,
+  },
+  "files.exclude": {
+    ".direnv": true,
+  },
+}
