@@ -4,10 +4,21 @@ import itertools
 import logging
 import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple, NamedTuple, Set, TypeVar
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Tuple,
+    NamedTuple,
+    Set,
+    TypeVar,
+)
 
 import click
 
+EqClassId = TypeVar("EqClassId")
 EqClassMember = TypeVar("EqClassMember")
 
 
@@ -28,9 +39,14 @@ class SizeEqClass(NamedTuple):
     size: int
 
 
-class HashEqClass(NamedTuple):
+class PrefixEqClass(NamedTuple):
     size_eq_class: SizeEqClass
-    size: bytes
+    prefix: bytes
+
+
+class HashEqClass(NamedTuple):
+    prefix_eq_class: PrefixEqClass
+    hash: bytes
 
 
 @dataclass()
@@ -56,11 +72,37 @@ def dedup(paths: Tuple[Path], dry_run: bool = False) -> None:
     logging.info("All files: %d", len(file_infos))
 
     inode_eq_classes = get_inode_eq_classes(file_infos)
-    size_eq_classes = get_size_eq_classes(inode_eq_classes)
-    hash_eq_classes = get_hash_eq_classes(inode_eq_classes, size_eq_classes)
-    content_eq_classes = get_content_eq_classes(
-        inode_eq_classes, hash_eq_classes.values()
+    # After this point it makes no more sense to refine equivalence classes of size 2
+    # That's because it's better to just compare the files rather than bother with
+    # costly prefix comparisons or hash calculation.
+    size_pairs, size_eq_classes = take_out_pairs(get_size_eq_classes(inode_eq_classes))
+    logging.info(
+        "Found %d pairs of inode classes with same size. Excluding them from further refinement.",
+        len(size_pairs),
     )
+    logging.info(
+        "Remaining inode classes for further refinement: %s",
+        members_count(size_eq_classes),
+    )
+    prefix_pairs, prefix_eq_classes = take_out_pairs(
+        get_prefix_eq_classes(inode_eq_classes, size_eq_classes)
+    )
+    logging.info(
+        "Found %d pairs of inode classes with same prefix. Excluding them from further refinement.",
+        len(prefix_pairs),
+    )
+    logging.info(
+        "Remaining inode classes for further refinement: %s",
+        members_count(prefix_eq_classes),
+    )
+    hash_eq_classes = get_hash_eq_classes(inode_eq_classes, prefix_eq_classes)
+    content_eq_classes = get_content_eq_classes(
+        inode_eq_classes,
+        itertools.chain(
+            hash_eq_classes.values(), size_pairs.values(), prefix_pairs.values()
+        ),
+    )
+
     hardlink(inode_eq_classes, content_eq_classes, dry_run)
     report(inode_eq_classes, content_eq_classes)
 
@@ -127,11 +169,7 @@ def get_size_eq_classes(
             size_eq_classes[size_eq_class] = size_eq_class_members
         size_eq_class_members.add(inode_eq_class)
 
-    non_trivial_size_eq_classes = {
-        size_eq_class: size_eq_class_members
-        for size_eq_class, size_eq_class_members in size_eq_classes.items()
-        if len(size_eq_class_members) > 1
-    }
+    non_trivial_size_eq_classes = exclude_unique(size_eq_classes)
 
     logging.info(
         "Excluded by size: %d (number of inode classes excluded from deduplication because they have unique file sizes)",
@@ -141,48 +179,116 @@ def get_size_eq_classes(
     return non_trivial_size_eq_classes
 
 
-def get_hash_eq_classes(
+RefinedEqClassId = TypeVar("RefinedEqClassId")
+
+
+def members_count(eq_classes: Dict[EqClassId, Set[EqClassMember]]) -> int:
+    return sum(len(eq_class_members) for eq_class_members in eq_classes.values())
+
+
+def refine_eq_classes(
+    eq_classes: Dict[EqClassId, Set[EqClassMember]],
+    refine: Callable[[EqClassId, EqClassMember, ProgressCounter], RefinedEqClassId],
+) -> Dict[RefinedEqClassId, Set[EqClassMember]]:
+    refined_eq_classes: Dict[RefinedEqClassId, Set[EqClassMember]] = {}
+    progress_counter = ProgressCounter(remaining=members_count(eq_classes))
+    for eq_class_id, eq_class_members in eq_classes.items():
+        for eq_class_member in eq_class_members:
+            progress_counter.actual += 1
+            refined_eq_class_id = refine(eq_class_id, eq_class_member, progress_counter)
+            refined_eq_class_members = refined_eq_classes.get(refined_eq_class_id)
+            if refined_eq_class_members is None:
+                refined_eq_class_members = set()
+                refined_eq_classes[refined_eq_class_id] = refined_eq_class_members
+            refined_eq_class_members.add(eq_class_member)
+    return refined_eq_classes
+
+
+def exclude_unique(
+    eq_classes: Dict[EqClassId, Set[EqClassMember]],
+) -> Dict[EqClassId, Set[EqClassMember]]:
+    return {
+        eq_class_id: eq_class_members
+        for eq_class_id, eq_class_members in eq_classes.items()
+        if len(eq_class_members) > 1
+    }
+
+
+def take_out_pairs(
+    eq_classes: Dict[EqClassId, Set[EqClassMember]],
+) -> Tuple[Dict[EqClassId, Set[EqClassMember]], Dict[EqClassId, Set[EqClassMember]]]:
+    pairs = {
+        eq_class_id: eq_class_members
+        for eq_class_id, eq_class_members in eq_classes.items()
+        if len(eq_class_members) == 2
+    }
+    bigger = {
+        eq_class_id: eq_class_members
+        for eq_class_id, eq_class_members in eq_classes.items()
+        if len(eq_class_members) > 2
+    }
+    return pairs, bigger
+
+
+def get_prefix_eq_classes(
     inode_eq_classes: Dict[InodeEqClass, Set[FileInfo]],
     size_eq_classes: Dict[SizeEqClass, Set[InodeEqClass]],
-) -> Dict[HashEqClass, Set[InodeEqClass]]:
-    hash_eq_classes: Dict[HashEqClass, Set[InodeEqClass]] = dict()
-    progress_counter = ProgressCounter(
-        remaining=sum(
-            len(size_eq_class_members)
-            for size_eq_class_members in size_eq_classes.values()
+) -> Dict[PrefixEqClass, Set[InodeEqClass]]:
+    def get_prefix_eq_id(
+        eq_class: SizeEqClass, eq_class_member: InodeEqClass, progress: ProgressCounter
+    ) -> PrefixEqClass:
+        file_info = representative(inode_eq_classes[eq_class_member])
+        logging.debug(
+            "Comparing file prefix %d out of %d. File size %d. File: '%s'.",
+            progress.actual,
+            progress.remaining,
+            eq_class.size,
+            str(file_info.path),
         )
-    )
-    for size_eq_class, size_eq_class_members in size_eq_classes.items():
-        for inode_eq_class in size_eq_class_members:
-            progress_counter.actual += 1
-            file_info = representative(inode_eq_classes[inode_eq_class])
-            logging.debug(
-                "Calculating hash %d out of %d. File size %d. File: '%s'.",
-                progress_counter.actual,
-                progress_counter.remaining,
-                size_eq_class.size,
-                str(file_info.path),
-            )
-            file_hash = hashlib.md5(file_info.path.read_bytes()).digest()
-            hash_eq_class = HashEqClass(size_eq_class, file_hash)
-            hash_eq_class_members = hash_eq_classes.get(hash_eq_class)
-            if hash_eq_class_members is None:
-                hash_eq_class_members = set()
-                hash_eq_classes[hash_eq_class] = hash_eq_class_members
-            hash_eq_class_members.add(inode_eq_class)
+        with file_info.path.open("rb") as file_handle:
+            prefix_bytes = file_handle.read(min(eq_class.size, 64))
+        return PrefixEqClass(eq_class, prefix_bytes)
 
-    non_trivial_hash_eq_classes = {
-        hash_eq_class: hash_eq_class_members
-        for hash_eq_class, hash_eq_class_members in hash_eq_classes.items()
-        if len(hash_eq_class_members) > 1
-    }
+    prefix_eq_classes = refine_eq_classes(size_eq_classes, refine=get_prefix_eq_id)
+    non_unique_prefix_eq_classes = exclude_unique(prefix_eq_classes)
+
+    logging.info(
+        "Excluded by prefix: %d (number of inode classes excluded from deduplication because they start with a unique string of bytes)",
+        len(prefix_eq_classes) - len(non_unique_prefix_eq_classes),
+    )
+
+    return non_unique_prefix_eq_classes
+
+
+def get_hash_eq_classes(
+    inode_eq_classes: Dict[InodeEqClass, Set[FileInfo]],
+    size_eq_classes: Dict[PrefixEqClass, Set[InodeEqClass]],
+) -> Dict[HashEqClass, Set[InodeEqClass]]:
+    def get_hash_eq_id(
+        eq_class: PrefixEqClass,
+        eq_class_member: InodeEqClass,
+        progress: ProgressCounter,
+    ) -> HashEqClass:
+        file_info = representative(inode_eq_classes[eq_class_member])
+        logging.debug(
+            "Calculating hash %d out of %d. File size %d. File: '%s'.",
+            progress.actual,
+            progress.remaining,
+            eq_class.size_eq_class.size,
+            str(file_info.path),
+        )
+        file_hash = hashlib.md5(file_info.path.read_bytes()).digest()
+        return HashEqClass(eq_class, file_hash)
+
+    hash_eq_classes = refine_eq_classes(size_eq_classes, refine=get_hash_eq_id)
+    non_unique_hash_eq_classes = exclude_unique(hash_eq_classes)
 
     logging.info(
         "Excluded by hash: %d (number of inode classes excluded from deduplication because they have unique hashes)",
-        len(hash_eq_classes) - len(non_trivial_hash_eq_classes),
+        len(hash_eq_classes) - len(non_unique_hash_eq_classes),
     )
 
-    return non_trivial_hash_eq_classes
+    return non_unique_hash_eq_classes
 
 
 def get_content_eq_classes(
@@ -259,7 +365,7 @@ def report(
 
 def hardlink(
     inode_eq_classes: Dict[InodeEqClass, Set[FileInfo]],
-    content_eq_classes: List[Set[InodeEqClass]],
+    content_eq_classes: Iterable[Set[InodeEqClass]],
     dry_run: bool,
 ) -> None:
     hardlinks_done = 0

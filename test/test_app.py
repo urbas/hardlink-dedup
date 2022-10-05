@@ -32,6 +32,15 @@ def test_dedup_files_with_same_contents(foo_file, tmp_path):
     assert other_foo_file.samefile(foo_file)
 
 
+def test_dedup_3_files_with_same_contents(foo_file, tmp_path):
+    """three different files with the same content should be hardlinked"""
+    other_foo_file = create_file(tmp_path / "otherFooDir")
+    third_foo_file = create_file(tmp_path / "thirdFooDir")
+    app.dedup([tmp_path])
+    assert other_foo_file.samefile(foo_file)
+    assert third_foo_file.samefile(foo_file)
+
+
 def test_dedup_files_newlines_in_names(tmp_path):
     """dedup must support newlines in file names"""
     newline_file1 = create_file(tmp_path / "Dir\n1", file_name="newline\nname1")
