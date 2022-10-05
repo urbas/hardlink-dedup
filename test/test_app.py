@@ -52,8 +52,12 @@ def test_dedup_files_newlines_in_names(tmp_path):
 def test_get_file_infos_direct_children(foo_file, bar_file):
     """file information is retrieved for direct children of given directories"""
     assert set(app.get_file_infos([foo_file.parent, bar_file.parent])) == {
-        app.FileInfo(foo_file, foo_file.stat().st_dev, foo_file.stat().st_ino, 6),
-        app.FileInfo(bar_file, bar_file.stat().st_dev, bar_file.stat().st_ino, 9),
+        app.FileInfo(
+            foo_file, app.Inode(foo_file.stat().st_dev, foo_file.stat().st_ino, 6)
+        ),
+        app.FileInfo(
+            bar_file, app.Inode(bar_file.stat().st_dev, bar_file.stat().st_ino, 9)
+        ),
     }
 
 
