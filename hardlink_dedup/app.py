@@ -36,12 +36,19 @@ class ProgressCounter:
     remaining: int
     actual: int = 0
 
-    def percent(self):
+    def percent(self) -> float:
+        if self.remaining == 0:
+            return 100
         return self.actual / self.remaining * 100
 
 
 @click.command()
-@click.option("-v", "--verbosity", count=True)
+@click.option(
+    "-v",
+    "--verbosity",
+    count=True,
+    help="Repeat this flag to increase verbosity: `-v` for progress, `-vv` for detailed operations.",
+)
 @click.option("-n", "--dry-run", count=True)
 @click.argument("paths", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def main(verbosity: int, dry_run: bool, paths: Tuple[Path]) -> None:
@@ -55,6 +62,7 @@ def main(verbosity: int, dry_run: bool, paths: Tuple[Path]) -> None:
 def dedup(paths: Tuple[Path], dry_run: bool = False) -> None:
     inodes_to_files = group_by_inodes(get_file_infos(paths))
     progress = ProgressCounter(len(inodes_to_files))
+    click.echo(f"Total files to compare: {len(inodes_to_files)}")
     files = (next(iter(files)) for files in inodes_to_files.values())
     size_groups = exclude_unique(same_size_groups(files), progress, unique_by="size")
     prefix_groups = exclude_unique(
@@ -144,7 +152,7 @@ def exclude_unique(
     for file_group in file_groups:
         if len(file_group) == 1:
             progress.actual += 1
-            logging.debug(
+            logging.info(
                 "[%.2f%%] Excluding '%s' from deduplication. We know it's unique by %s.",
                 progress.percent(),
                 next(iter(file_group)).path,
@@ -178,10 +186,13 @@ def same_prefix_groups(file_group: Set[FileInfo]) -> Iterable[Set[FileInfo]]:
 def same_hash_groups(
     file_group: Set[FileInfo],
 ) -> Iterable[Set[FileInfo]]:
-    return refine_group(
-        file_group,
-        key=lambda file_info: hashlib.md5(file_info.path.read_bytes()).digest(),
-    )
+    def _hash(file_info: FileInfo):
+        logging.debug(
+            "Hashing file '%s' (size: %d bytes)", file_info.path, file_info.inode.size
+        )
+        return hashlib.md5(file_info.path.read_bytes()).digest()
+
+    return refine_group(file_group, key=_hash)
 
 
 def same_content_groups(
@@ -226,12 +237,10 @@ def hardlink(
                 subprocess.run(
                     ["ln", "-f", original_file.path, file_to_replace.path], check=True
                 )
-    logging.info(
-        "%s %d files. Estimated saved space: %s bytes",
-        "Would hardlink" if dry_run else "Hardlinked",
-        hardlinks_done,
-        f"{total_size_dedup:,}",
+    click.echo(
+        f"{'Files to hardlink' if dry_run else 'Hardlinked files'}: {hardlinks_done}"
     )
+    click.echo(f"Estimated saved bytes: {total_size_dedup}")
 
 
 def find_equal_files(
@@ -239,6 +248,12 @@ def find_equal_files(
     other_files: Iterable[FileInfo],
 ) -> Iterator[FileInfo]:
     for other_file in other_files:
+        logging.debug(
+            "Comparing files '%s' and '%s' (both of size: %d bytes)",
+            this_file.path,
+            other_file.path,
+            this_file.inode.size,
+        )
         cmp_result = subprocess.run(
             ["cmp", "--quiet", this_file.path, other_file.path],
             text=True,
