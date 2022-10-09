@@ -49,6 +49,24 @@ def test_dedup_files_newlines_in_names(tmp_path):
     assert newline_file1.samefile(newline_file2)
 
 
+def test_dedup_hidden_files(tmp_path):
+    """hidden files should also be deduped"""
+    dot_file1 = create_file(tmp_path / "dotDir1", ".file1")
+    dot_file2 = create_file(tmp_path / "dotDir2", ".file2")
+    app.dedup([dot_file1.parent, dot_file2.parent])
+    assert dot_file1.samefile(dot_file2)
+
+
+def test_dedup_gitignored_files(tmp_path):
+    """gitignored files should also be deduped"""
+    create_file(tmp_path / "dir1", ".ignore", "file1")
+    create_file(tmp_path / "dir2", ".fdignore", "file2")
+    file1 = create_file(tmp_path / "dir1", "file1")
+    file2 = create_file(tmp_path / "dir2", "file2")
+    app.dedup([file1.parent, file2.parent])
+    assert file1.samefile(file2)
+
+
 def test_get_file_infos_direct_children(foo_file, bar_file):
     """file information is retrieved for direct children of given directories"""
     assert set(app.get_file_infos([foo_file.parent, bar_file.parent])) == {
@@ -87,8 +105,8 @@ def bar_file_fixture(tmp_path):
     return bar_file
 
 
-def create_file(parent_dir, file_name="foo"):
+def create_file(parent_dir, file_name="foo", content="hi foo"):
     foo_file = parent_dir / file_name
-    foo_file.parent.mkdir()
-    foo_file.write_text("hi foo")
+    foo_file.parent.mkdir(exist_ok=True)
+    foo_file.write_text(content)
     return foo_file

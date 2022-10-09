@@ -82,6 +82,8 @@ def get_file_infos(paths: Iterable[Path]) -> Iterable[FileInfo]:
         fd_result = subprocess.run(
             [
                 "fd",
+                "--hidden",
+                "--no-ignore",
                 "--print0",
                 "--type",
                 "file",
