@@ -1,0 +1,26 @@
+[package]
+name = "hardlink_dedup"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hardlink_dedup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hardlink-dedup"
+path = "src/main.rs"
+
+[dev-dependencies]
+assert_cmd = "*"
+predicates = "*"
+tempfile = "*"
+
+[dependencies]
+clap = { version = "*", features = ["derive"] }
+colored = "*"
+env_logger = "*"
+log = "*"
+sha2 = "*"
+uuid = { version = "*", features = ["v4"] }
+walkdir = "*"
