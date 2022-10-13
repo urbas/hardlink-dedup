@@ -27,6 +27,17 @@ jobs:
             /home/runner/.nix-profile
           key: ${{ runner.os }}-${{ env.cache-name }}-${{ hashFiles('**/flake.nix', '**/flake.lock') }}
 
+      - name: Cache Rust Artifacts
+        uses: actions/cache@v2
+        env:
+          cache-name: cache-rust-artifacts-v1
+        with:
+          path: |
+            /home/runner/.rustup
+            /home/runner/.cargo
+            target
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
+
       - name: Nix Install
         run: |
           [ -f /home/runner/.nix-profile/etc/profile.d/nix.sh ] || sh <(curl -L https://nixos.org/nix/install) --no-daemon
@@ -37,6 +48,5 @@ jobs:
           eval "$(nix print-dev-env)"
 
           set -x
-          black --check .
-          flake8
-          pytest
+          rustfmt --check **/*.rs
+          cargo test
