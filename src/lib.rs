@@ -3,51 +3,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{hard_link, metadata, remove_file, rename, File};
 use std::io;
-use std::io::{BufReader, Read, Result};
+use std::io::{BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::{DirEntry, DirEntryExt, WalkDir};
-
-struct DedupContext<'a> {
-    dry_run: bool,
-    total: usize,
-    processed: usize,
-    bytes_deduped: usize,
-    inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>,
-}
-
-impl<'a> DedupContext<'a> {
-    fn new(inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>, dry_run: bool) -> DedupContext {
-        DedupContext {
-            dry_run: dry_run,
-            total: inode_to_paths.len(),
-            processed: 0,
-            bytes_deduped: 0,
-            inode_to_paths: inode_to_paths,
-        }
-    }
-}
-
-impl<'a> std::fmt::Display for DedupContext<'a> {
-    fn fmt(
-        &self,
-        formatter: &mut std::fmt::Formatter<'_>,
-    ) -> std::result::Result<(), std::fmt::Error> {
-        let percentage = if self.total == 0 {
-            100.0
-        } else {
-            (self.processed as f64) / (self.total as f64) * 100.0
-        };
-        write!(
-            formatter,
-            "{:.2}%{}; {} bytes deduped",
-            percentage,
-            if self.dry_run { "; dry run" } else { "" },
-            self.bytes_deduped,
-        )
-    }
-}
 
 pub fn dedup(paths: &Vec<PathBuf>, dry_run: bool, paranoid: bool) {
     let inode_to_paths = find_inode_groups(paths);
@@ -88,6 +48,43 @@ pub fn dedup(paths: &Vec<PathBuf>, dry_run: bool, paranoid: bool) {
         }
     }
     println!("Estimated saved bytes: {}", ctx.bytes_deduped);
+}
+
+struct DedupContext<'a> {
+    dry_run: bool,
+    total: usize,
+    processed: usize,
+    bytes_deduped: usize,
+    inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>,
+}
+
+impl<'a> DedupContext<'a> {
+    fn new(inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>, dry_run: bool) -> DedupContext {
+        DedupContext {
+            dry_run: dry_run,
+            total: inode_to_paths.len(),
+            processed: 0,
+            bytes_deduped: 0,
+            inode_to_paths: inode_to_paths,
+        }
+    }
+}
+
+impl<'a> std::fmt::Display for DedupContext<'a> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let percentage = if self.total == 0 {
+            100.0
+        } else {
+            (self.processed as f64) / (self.total as f64) * 100.0
+        };
+        write!(
+            formatter,
+            "{:.2}%{}; {} bytes deduped",
+            percentage,
+            if self.dry_run { "; dry run" } else { "" },
+            self.bytes_deduped,
+        )
+    }
 }
 
 fn exclude_if_unique<'a>(
@@ -137,7 +134,6 @@ fn hardlink_dedup<'a>(same_files_group: HashSet<&'a PathBuf>, ctx: &mut DedupCon
                 replace_many_with_hard_link(
                     &original_file,
                     ctx.inode_to_paths[&other_file_metadata.ino()].iter(),
-                    ctx.dry_run,
                     ctx,
                 );
                 ctx.bytes_deduped += other_file_metadata.len() as usize;
@@ -149,11 +145,10 @@ fn hardlink_dedup<'a>(same_files_group: HashSet<&'a PathBuf>, ctx: &mut DedupCon
 fn replace_many_with_hard_link<'a>(
     original_file: &Path,
     targets: impl Iterator<Item = &'a PathBuf>,
-    dry_run: bool,
     ctx: &DedupContext,
 ) {
     for target in targets {
-        if dry_run {
+        if ctx.dry_run {
             println!(
                 "[{}] Would hardlink {:?} to {:?}.",
                 ctx, original_file, target
@@ -170,7 +165,7 @@ fn replace_many_with_hard_link<'a>(
     }
 }
 
-fn replace_with_hard_link(original_file: &Path, target: &Path) -> std::result::Result<(), String> {
+fn replace_with_hard_link(original_file: &Path, target: &Path) -> Result<(), String> {
     let tmp_file = target.parent().unwrap().join(Uuid::new_v4().to_string());
     let _ = hard_link(original_file, &tmp_file).map_err(|err| {
         format!(
@@ -312,7 +307,7 @@ fn find_equal_files<'a>(file: &Path, other_files: &HashSet<&'a PathBuf>) -> Hash
     equal_files
 }
 
-fn are_files_same(file: &Path, other_file: &Path) -> Result<bool> {
+fn are_files_same(file: &Path, other_file: &Path) -> io::Result<bool> {
     let open_file_1 = File::open(file)?;
     let open_file_2 = File::open(other_file)?;
     let mut reader1 = BufReader::new(open_file_1);
@@ -335,14 +330,14 @@ fn are_files_same(file: &Path, other_file: &Path) -> Result<bool> {
     }
 }
 
-fn read_prefix(file: &Path) -> std::io::Result<Vec<u8>> {
+fn read_prefix(file: &Path) -> io::Result<Vec<u8>> {
     let mut buffer = vec![0; 64];
     let mut file_handle = File::open(file)?;
     file_handle.read(&mut buffer[..])?;
     Ok(buffer)
 }
 
-fn calculate_hash(file: &Path) -> std::io::Result<Vec<u8>> {
+fn calculate_hash(file: &Path) -> io::Result<Vec<u8>> {
     let mut file_handle = File::open(file)?;
     let mut hasher = Sha256::new();
     io::copy(&mut file_handle, &mut hasher)?;
