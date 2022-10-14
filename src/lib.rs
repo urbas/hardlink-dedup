@@ -9,23 +9,27 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::{DirEntry, DirEntryExt, WalkDir};
 
-struct Progress {
+struct DedupContext<'a> {
+    dry_run: bool,
     total: usize,
     processed: usize,
     bytes_deduped: usize,
+    inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>,
 }
 
-impl Progress {
-    fn new(total: usize) -> Progress {
-        Progress {
-            total: total,
+impl<'a> DedupContext<'a> {
+    fn new(inode_to_paths: &'a HashMap<u64, HashSet<PathBuf>>, dry_run: bool) -> DedupContext {
+        DedupContext {
+            dry_run: dry_run,
+            total: inode_to_paths.len(),
             processed: 0,
             bytes_deduped: 0,
+            inode_to_paths: inode_to_paths,
         }
     }
 }
 
-impl std::fmt::Display for Progress {
+impl<'a> std::fmt::Display for DedupContext<'a> {
     fn fmt(
         &self,
         formatter: &mut std::fmt::Formatter<'_>,
@@ -37,160 +41,160 @@ impl std::fmt::Display for Progress {
         };
         write!(
             formatter,
-            "{:.2}%; {} bytes deduped",
-            percentage, self.bytes_deduped
+            "{:.2}%{}; {} bytes deduped",
+            percentage,
+            if self.dry_run { "; dry run" } else { "" },
+            self.bytes_deduped,
         )
     }
 }
 
 pub fn dedup(paths: &Vec<PathBuf>, dry_run: bool, paranoid: bool) {
     let inode_to_paths = find_inode_groups(paths);
+    let mut ctx = DedupContext::new(&inode_to_paths, dry_run);
+    println!("Processing {} files.", ctx.total);
     let files = inode_to_paths
         .values()
         .map(|file_group| file_group.iter().nth(0))
         .flatten();
-    println!("Processing {} files.", inode_to_paths.len());
-    let mut progress = Progress::new(inode_to_paths.len());
-    // TODO: This nesting is horrible... let's improve on this
-    for size_group in same_size_groups(files) {
-        if exclude_if_unique(&size_group, &mut progress, "It has unique size.") {
+    for size_group in same_metadata_groups(files) {
+        if exclude_if_unique(
+            &size_group,
+            &mut ctx,
+            "It has unique size, uid, gid, or mode.",
+        ) {
             continue;
         }
-        if dedup_if_pair(&inode_to_paths, &size_group, dry_run, &mut progress) {
+        if dedup_if_pair(&size_group, &mut ctx) {
             continue;
         }
         for prefix_group in same_prefix_groups(size_group) {
-            if exclude_if_unique(&prefix_group, &mut progress, "It has a unique prefix.") {
+            if exclude_if_unique(&prefix_group, &mut ctx, "It has a unique prefix.") {
                 continue;
             }
-            if dedup_if_pair(&inode_to_paths, &prefix_group, dry_run, &mut progress) {
+            if dedup_if_pair(&prefix_group, &mut ctx) {
                 continue;
             }
             for hash_group in same_hash_groups(prefix_group) {
-                if exclude_if_unique(&hash_group, &mut progress, "It has a unique hash.") {
+                if exclude_if_unique(&hash_group, &mut ctx, "It has a unique hash.") {
                     continue;
                 }
                 if paranoid {
-                    same_content_dedup(&inode_to_paths, &hash_group, dry_run, &mut progress);
+                    same_content_dedup(&hash_group, &mut ctx);
                 } else {
-                    hardlink_dedup(&inode_to_paths, hash_group, dry_run, &mut progress);
+                    hardlink_dedup(hash_group, &mut ctx);
                 }
             }
         }
     }
-    println!("Estimated saved bytes: {}", progress.bytes_deduped);
+    println!("Estimated saved bytes: {}", ctx.bytes_deduped);
 }
 
 fn exclude_if_unique<'a>(
     group: &HashSet<&'a PathBuf>,
-    progress: &mut Progress,
+    ctx: &mut DedupContext,
     uniqueness_msg: &str,
 ) -> bool {
     if group.len() > 1 {
         return false;
     }
-    progress.processed += group.len();
+    ctx.processed += group.len();
     println!(
         "[{}] Excluding {:?} from deduplication. {}",
-        progress,
+        ctx,
         group.iter().nth(0).unwrap(),
         uniqueness_msg,
     );
     true
 }
 
-fn dedup_if_pair<'a>(
-    inode_to_paths: &HashMap<u64, HashSet<PathBuf>>,
-    group: &HashSet<&'a PathBuf>,
-    dry_run: bool,
-    progress: &mut Progress,
-) -> bool {
+/// If we have a pair of same-sized files, it's faster to compare them byte-for-byte
+/// rather than calculate their hashes and compare hashes.
+fn dedup_if_pair<'a>(group: &HashSet<&'a PathBuf>, ctx: &mut DedupContext) -> bool {
     if group.len() == 2 {
-        same_content_dedup(&inode_to_paths, group, dry_run, progress);
+        same_content_dedup(group, ctx);
         return true;
     }
     false
 }
 
-fn same_content_dedup<'a>(
-    inode_to_paths: &HashMap<u64, HashSet<PathBuf>>,
-    file_group: &HashSet<&'a PathBuf>,
-    dry_run: bool,
-    progress: &mut Progress,
-) {
+fn same_content_dedup<'a>(file_group: &HashSet<&'a PathBuf>, ctx: &mut DedupContext) {
     for content_group in same_content_groups(file_group) {
-        if exclude_if_unique(&content_group, progress, "It has unique contents.") {
-        } else {
-            hardlink_dedup(&inode_to_paths, content_group, dry_run, progress)
+        if exclude_if_unique(&content_group, ctx, "It has unique contents.") {
+            continue;
         }
+        hardlink_dedup(content_group, ctx)
     }
 }
 
-fn hardlink_dedup<'a>(
-    inode_to_paths: &HashMap<u64, HashSet<PathBuf>>,
-    same_files_group: HashSet<&'a PathBuf>,
-    dry_run: bool,
-    progress: &mut Progress,
-) {
+fn hardlink_dedup<'a>(same_files_group: HashSet<&'a PathBuf>, ctx: &mut DedupContext) {
     let mut same_files_iterator = same_files_group.iter();
     if let Some(original_file) = same_files_iterator.next() {
-        progress.processed += 1;
+        ctx.processed += 1;
         while let Some(other_file) = same_files_iterator.next() {
-            progress.processed += 1;
+            ctx.processed += 1;
             if let Ok(other_file_metadata) = metadata(other_file) {
-                hardlink(
+                replace_many_with_hard_link(
                     &original_file,
-                    inode_to_paths[&other_file_metadata.ino()].iter(),
-                    dry_run,
-                    progress,
+                    ctx.inode_to_paths[&other_file_metadata.ino()].iter(),
+                    ctx.dry_run,
+                    ctx,
                 );
-                progress.bytes_deduped += other_file_metadata.len() as usize;
+                ctx.bytes_deduped += other_file_metadata.len() as usize;
             }
         }
     }
 }
 
-fn hardlink<'a>(
+fn replace_many_with_hard_link<'a>(
     original_file: &Path,
     targets: impl Iterator<Item = &'a PathBuf>,
     dry_run: bool,
-    progress: &Progress,
+    ctx: &DedupContext,
 ) {
     for target in targets {
         if dry_run {
             println!(
                 "[{}] Would hardlink {:?} to {:?}.",
-                progress, original_file, target
+                ctx, original_file, target
             );
             continue;
         }
-        let tmp_file = target.parent().unwrap().join(Uuid::new_v4().to_string());
-        if let Err(err) = hard_link(original_file, &tmp_file) {
-            warn!(
-                "Failed to create temprary hardlink of {:?} at {:?}. Error: {}",
-                original_file, tmp_file, err
-            );
-            continue;
-        }
-        match rename(&tmp_file, target) {
-            Ok(_) => println!(
-                "[{}] Hardlinked {:?} to {:?}.",
-                progress, original_file, target
+        match replace_with_hard_link(original_file, target) {
+            Ok(_) => println!("[{}] Hardlinked {:?} to {:?}.", ctx, original_file, target),
+            Err(err) => warn!(
+                "Failed to hardlink {:?} to {:?}. Error: {}",
+                original_file, target, err
             ),
-            Err(err) => {
-                warn!(
-                    "Failed to hardlink {:?} to {:?}. Error: {}",
-                    original_file, target, err
-                );
-                if let Err(err) = remove_file(&tmp_file) {
-                    warn!(
-                        "Failed to delete the temprary file {:?}. Error: {}",
-                        tmp_file, err
-                    );
-                }
-            }
         }
     }
+}
+
+fn replace_with_hard_link(original_file: &Path, target: &Path) -> std::result::Result<(), String> {
+    let tmp_file = target.parent().unwrap().join(Uuid::new_v4().to_string());
+    let _ = hard_link(original_file, &tmp_file).map_err(|err| {
+        format!(
+            "Failed to create temporary hardlink of {:?} at {:?}. Error: {}",
+            original_file, tmp_file, err
+        )
+    })?;
+    rename(&tmp_file, target)
+        .map_err(|err| {
+            format!(
+                "Failed to replace target file {:?} with temporary hardlink {:?}. Error: {}",
+                target, tmp_file, err
+            )
+        })
+        .map_err(|err| {
+            if let Err(inner_err) = remove_file(&tmp_file) {
+                format!(
+                    "After error '{}' also failed to delete temporary file {:?} with error: {}",
+                    err, tmp_file, inner_err
+                )
+            } else {
+                err
+            }
+        })
 }
 
 fn find_inode_groups(paths: &Vec<PathBuf>) -> HashMap<u64, HashSet<PathBuf>> {
@@ -230,20 +234,48 @@ where
     groups.into_values()
 }
 
-fn same_size_groups<'a>(
+fn same_metadata_groups<'a>(
     files: impl Iterator<Item = &'a PathBuf>,
 ) -> impl Iterator<Item = HashSet<&'a PathBuf>> {
-    group_by(files, |file| metadata(file).map(|m| m.len()).ok())
+    group_by(files, |file| {
+        metadata(file)
+            .map(|m| (m.len(), m.gid(), m.uid(), m.mode()))
+            .map_err(|err| {
+                warn!(
+                    "Skipping file {:?}. Failed to fetch its metadata. Error: {}",
+                    file, err
+                )
+            })
+            .ok()
+    })
 }
 
 fn same_prefix_groups<'a>(
     files: HashSet<&'a PathBuf>,
 ) -> impl Iterator<Item = HashSet<&'a PathBuf>> {
-    group_by(files.into_iter(), |file| read_prefix(file).ok())
+    group_by(files.into_iter(), |file| {
+        read_prefix(file)
+            .map_err(|err| {
+                warn!(
+                    "Skipping file {:?}. Failed to read its first few bytes. Error: {}",
+                    file, err
+                )
+            })
+            .ok()
+    })
 }
 
 fn same_hash_groups<'a>(files: HashSet<&'a PathBuf>) -> impl Iterator<Item = HashSet<&'a PathBuf>> {
-    group_by(files.into_iter(), |file| calculate_hash(file).ok())
+    group_by(files.into_iter(), |file| {
+        calculate_hash(file)
+            .map_err(|err| {
+                warn!(
+                    "Skipping file {:?}. Failed to calculate its hash. Error: {}",
+                    file, err
+                )
+            })
+            .ok()
+    })
 }
 
 fn same_content_groups<'a>(files: &HashSet<&'a PathBuf>) -> Vec<HashSet<&'a PathBuf>> {
@@ -325,7 +357,7 @@ mod tests {
 
     #[test]
     fn same_size_group_empty() {
-        let mut size_groups = same_size_groups(std::iter::empty());
+        let mut size_groups = same_metadata_groups(std::iter::empty());
         assert_eq!(size_groups.next(), None);
     }
 
@@ -333,7 +365,7 @@ mod tests {
     fn one_same_size() {
         let tmp_dir = tempdir().unwrap();
         let file1 = tmp_file(&tmp_dir.path().join("dir1"), "file1", "contents 1");
-        let mut size_groups = same_size_groups(vec![&file1].into_iter());
+        let mut size_groups = same_metadata_groups(vec![&file1].into_iter());
         assert_eq!(size_groups.next().unwrap(), HashSet::from([&file1]));
         assert_eq!(size_groups.next(), None);
     }
@@ -343,7 +375,7 @@ mod tests {
         let tmp_dir = tempdir().unwrap();
         let file1 = tmp_file(&tmp_dir.path().join("dir1"), "file1", "contents 1");
         let file2 = tmp_file(&tmp_dir.path().join("dir2"), "file2", "contents 2");
-        let mut size_groups = same_size_groups(vec![&file1, &file2].into_iter());
+        let mut size_groups = same_metadata_groups(vec![&file1, &file2].into_iter());
         assert_eq!(size_groups.next().unwrap(), HashSet::from([&file1, &file2]));
         assert_eq!(size_groups.next(), None);
     }
@@ -355,7 +387,7 @@ mod tests {
         let file2 = tmp_file(&tmp_dir.path().join("dir2"), "file2", "contents 2");
         let smaller_file = tmp_file(&tmp_dir.path().join("dir3"), "smaller_file", "smaller");
         let size_groups: Vec<HashSet<&PathBuf>> =
-            same_size_groups(vec![&file1, &file2, &smaller_file].into_iter()).collect();
+            same_metadata_groups(vec![&file1, &file2, &smaller_file].into_iter()).collect();
         assert!(size_groups.contains(&HashSet::from([&file1, &file2])));
         assert!(size_groups.contains(&HashSet::from([&smaller_file])));
         assert_eq!(size_groups.len(), 2);
@@ -387,11 +419,40 @@ mod tests {
         assert_eq!(hash_groups.len(), 2);
     }
 
+    #[test]
+    fn two_same_content_one_different() {
+        let tmp_dir = tempdir().unwrap();
+        let file1 = tmp_file(&tmp_dir.path().join("dir1"), "file1", "same content");
+        let file2 = tmp_file(&tmp_dir.path().join("dir2"), "file2", "same content");
+        let smaller_file = tmp_file(&tmp_dir.path().join("dir3"), "smaller_file", "smaller");
+        let content_groups: Vec<HashSet<&PathBuf>> =
+            same_content_groups(&HashSet::from([&file1, &file2, &smaller_file]));
+        assert!(content_groups.contains(&HashSet::from([&file1, &file2])));
+        assert!(content_groups.contains(&HashSet::from([&smaller_file])));
+        assert_eq!(content_groups.len(), 2);
+    }
+
+    #[test]
+    fn replace_with_hardlink_same() {
+        let tmp_dir = tempdir().unwrap();
+        let file1 = tmp_file(&tmp_dir.path().join("dir1"), "file1", "same content");
+        let file2 = tmp_file(&tmp_dir.path().join("dir2"), "file2", "same content");
+        let hard_link_result = replace_with_hard_link(&file1, &file2);
+        assert_eq!(hard_link_result.unwrap(), ());
+        assert!(same(&file1, &file2));
+    }
+
     fn tmp_file(dir: &Path, file_name: &str, contents: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(file_name);
         let mut file = File::create(&path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         return path;
+    }
+
+    pub fn same(file1: &Path, file2: &Path) -> bool {
+        let metadata1 = metadata(file1).unwrap();
+        let metadata2 = metadata(file2).unwrap();
+        metadata1.ino() == metadata2.ino()
     }
 }

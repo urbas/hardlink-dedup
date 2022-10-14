@@ -15,6 +15,7 @@ path = "src/main.rs"
 assert_cmd = "*"
 predicates = "*"
 tempfile = "*"
+nix = "*"
 
 [dependencies]
 clap = { version = "*", features = ["derive"] }
